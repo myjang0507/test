@@ -44,9 +44,6 @@
 #include <mach/cpufreq.h>
 #endif
 #include "cpu_load_metric.h"
-#ifdef CONFIG_PMU_COREMEM_RATIO
-#include "pmu_func.h"
-#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_interactive.h>
@@ -69,10 +66,6 @@ struct cpufreq_interactive_cpuinfo {
 	u64 hispeed_validate_time;
 	struct rw_semaphore enable_sem;
 	int governor_enabled;
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	int region;
-	int prev_region;
-#endif
 };
 
 static DEFINE_PER_CPU(struct cpufreq_interactive_cpuinfo, cpuinfo);
@@ -80,10 +73,6 @@ static DEFINE_PER_CPU(struct cpufreq_interactive_cpuinfo, cpuinfo);
 static cpumask_t speedchange_cpumask;
 static spinlock_t speedchange_cpumask_lock;
 static struct mutex gov_lock;
-#ifdef CONFIG_PMU_COREMEM_RATIO
-static cpumask_t regionchange_cpumask;
-static spinlock_t regionchange_cpumask_lock;
-#endif
 
 /* Target load.  Lower values result in higher CPU speeds. */
 #define DEFAULT_TARGET_LOAD 90
@@ -110,17 +99,17 @@ static bool hmp_boost;
 #define DEFAULT_MULTI_EXIT_TIME (16 * DEFAULT_TIMER_RATE)
 #define DEFAULT_SINGLE_ENTER_TIME (8 * DEFAULT_TIMER_RATE)
 #define DEFAULT_SINGLE_EXIT_TIME (4 * DEFAULT_TIMER_RATE)
-#define DEFAULT_SINGLE_CLUSTER0_MIN_FREQ 0
-#define DEFAULT_MULTI_CLUSTER0_MIN_FREQ 0
+#define DEFAULT_SINGLE_KFC_MIN_FREQ 0
+#define DEFAULT_MULTI_KFC_MIN_FREQ 0
 
 static DEFINE_PER_CPU(struct cpufreq_loadinfo, loadinfo);
 static DEFINE_PER_CPU(unsigned int, cpu_util);
 
-static struct pm_qos_request cluster0_min_freq_qos;
+static struct pm_qos_request kfc_min_freq_qos;
 static void mode_auto_change_minlock(struct work_struct *work);
 static struct workqueue_struct *mode_auto_change_minlock_wq;
 static struct work_struct mode_auto_change_minlock_work;
-static unsigned int cluster0_min_freq=0;
+static unsigned int kfc_min_freq=0;
 
 #define set_qos(req, pm_qos_class, value) { \
 	if (value) { \
@@ -180,13 +169,6 @@ struct cpufreq_interactive_tunables {
 #define TASK_NAME_LEN 15
 	/* realtime thread handles frequency scaling */
 	struct task_struct *speedchange_task;
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	struct task_struct *regionchange_task;
-	unsigned int prev_max_region;
-	unsigned int max_region;
-	u64 region_time_in_state[6];
-	u64 region_last_stat;
-#endif
 
 	/* handle for get cpufreq_policy */
 	unsigned int *policy;
@@ -216,8 +198,8 @@ struct cpufreq_interactive_tunables {
 	unsigned int param_index;
 	unsigned int cur_param_index;
 
-	unsigned int single_cluster0_min_freq;
-	unsigned int multi_cluster0_min_freq;
+	unsigned int single_kfc_min_freq;
+	unsigned int multi_kfc_min_freq;
 
 #define MAX_PARAM_SET 4 /* ((MULTI_MODE | SINGLE_MODE | NO_MODE) + 1) */
 	unsigned int hispeed_freq_set[MAX_PARAM_SET];
@@ -286,11 +268,7 @@ static void cpufreq_interactive_timer_resched(
 	unsigned long expires;
 	unsigned long flags;
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	if (!tunables->speedchange_task || !tunables->regionchange_task)
-#else
 	if (!tunables->speedchange_task)
-#endif
 		return;
 
 	spin_lock_irqsave(&pcpu->load_lock, flags);
@@ -324,11 +302,7 @@ static void cpufreq_interactive_timer_start(
 		usecs_to_jiffies(tunables->timer_rate);
 	unsigned long flags;
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	if (!tunables->speedchange_task || !tunables->regionchange_task)
-#else
 	if (!tunables->speedchange_task)
-#endif
 		return;
 
 	pcpu->cpu_timer.expires = expires;
@@ -413,7 +387,7 @@ static unsigned int choose_freq(struct cpufreq_interactive_cpuinfo *pcpu,
 
 		if (cpufreq_frequency_table_target(
 			    pcpu->policy, pcpu->freq_table, loadadjfreq / tl,
-			    CPUFREQ_RELATION_L, &index))
+			    CPUFREQ_RELATION_H, &index))
 			break;
 		freq = pcpu->freq_table[index].frequency;
 
@@ -455,7 +429,7 @@ static unsigned int choose_freq(struct cpufreq_interactive_cpuinfo *pcpu,
 				 */
 				if (cpufreq_frequency_table_target(
 					    pcpu->policy, pcpu->freq_table,
-					    freqmin + 1, CPUFREQ_RELATION_L,
+					    freqmin + 1, CPUFREQ_RELATION_H,
 					    &index))
 					break;
 				freq = pcpu->freq_table[index].frequency;
@@ -632,9 +606,9 @@ static void enter_mode(struct cpufreq_interactive_tunables * tunables)
 {
 	set_new_param_set(tunables->mode, tunables);
 	if(tunables->mode & SINGLE_MODE)
-		cluster0_min_freq = tunables->single_cluster0_min_freq;
+		kfc_min_freq = tunables->single_kfc_min_freq;
 	if(tunables->mode & MULTI_MODE)
-		cluster0_min_freq = tunables->multi_cluster0_min_freq;
+		kfc_min_freq = tunables->multi_kfc_min_freq;
 	if(!hmp_boost) {
 		pr_debug("%s mp boost on", __func__);
 		(void)set_hmp_boost(1);
@@ -647,7 +621,7 @@ static void enter_mode(struct cpufreq_interactive_tunables * tunables)
 static void exit_mode(struct cpufreq_interactive_tunables * tunables)
 {
 	set_new_param_set(0, tunables);
-	cluster0_min_freq = 0;
+	kfc_min_freq = 0;
 
 	if(hmp_boost) {
 		pr_debug("%s mp boost off", __func__);
@@ -676,10 +650,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 	bool boosted;
 #ifdef CONFIG_MODE_AUTO_CHANGE
 	unsigned int new_mode;
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	struct pmu_count_value pmu_data;
-	int region = 0;
 #endif
 	if (!down_read_trylock(&pcpu->enable_sem))
 		return;
@@ -716,24 +686,6 @@ static void cpufreq_interactive_timer(unsigned long data)
 	cpu_load = loadadjfreq / pcpu->target_freq;
 	boosted = tunables->boost_val || now < tunables->boostpulse_endtime;
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	/* Get crypto load information from PMU */
-	pmu_data.core_num = data;
-	pmu_data.valid = 0;
-
-	read_pmu_one(&pmu_data);
-
-	pcpu->prev_region = pcpu->region;
-	region = coremem_ratio(pmu_data.pmnc1, pmu_data.pmnc2);
-	if (region != pcpu->prev_region) {
-		pcpu->region = region;
-		spin_lock_irqsave(&regionchange_cpumask_lock, flags);
-		cpumask_set_cpu(data, &regionchange_cpumask);
-		spin_unlock_irqrestore(&regionchange_cpumask_lock, flags);
-		wake_up_process(tunables->regionchange_task);
-	}
-#endif
-
 	if (cpu_load >= tunables->go_hispeed_load || boosted) {
 		if (pcpu->target_freq < tunables->hispeed_freq) {
 			new_freq = tunables->hispeed_freq;
@@ -764,10 +716,10 @@ static void cpufreq_interactive_timer(unsigned long data)
 	pcpu->hispeed_validate_time = now;
 
 	if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
-					   new_freq, CPUFREQ_RELATION_L,
+					   new_freq, CPUFREQ_RELATION_H,
 					   &index)) {
 		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
-		goto rearm;
+ 		goto rearm;
 	}
 
 	new_freq = pcpu->freq_table[index].frequency;
@@ -894,88 +846,6 @@ static void cpufreq_interactive_idle_end(void)
 
 	up_read(&pcpu->enable_sem);
 }
-
-#ifdef CONFIG_PMU_COREMEM_RATIO
-static void region_update_status(struct cpufreq_interactive_tunables *tunables)
-{
-	unsigned long cur_time;
-
-	cur_time = jiffies;
-	tunables->region_time_in_state[tunables->prev_max_region] +=
-			cur_time - tunables->region_last_stat;
-	tunables->region_last_stat = cur_time;
-}
-
-static int cpufreq_interactive_regionchange_task(void *data)
-{
-	unsigned int cpu;
-	cpumask_t tmp_mask;
-	cpumask_t policy_mask;
-	unsigned long flags;
-	struct cpufreq_interactive_cpuinfo *pcpu;
-
-	while (1) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		spin_lock_irqsave(&regionchange_cpumask_lock, flags);
-
-		pcpu = &per_cpu(cpuinfo, smp_processor_id());
-		cpumask_and(&policy_mask, &regionchange_cpumask, pcpu->policy->related_cpus);
-		if (cpumask_empty(&policy_mask)) {
-			spin_unlock_irqrestore(&regionchange_cpumask_lock, flags);
-
-			if (kthread_should_stop())
-				break;
-
-			schedule();
-
-			if (kthread_should_stop())
-				break;
-
-			spin_lock_irqsave(&regionchange_cpumask_lock, flags);
-		}
-
-		set_current_state(TASK_RUNNING);
-		cpumask_and(&tmp_mask, &regionchange_cpumask, pcpu->policy->related_cpus);
-		cpumask_andnot(&regionchange_cpumask, &regionchange_cpumask, pcpu->policy->related_cpus);
-		spin_unlock_irqrestore(&regionchange_cpumask_lock, flags);
-
-		for_each_cpu(cpu, &tmp_mask) {
-			unsigned int j;
-			unsigned int max_region = 0;
-			struct cpufreq_interactive_tunables *tunables;
-
-			pcpu = &per_cpu(cpuinfo, cpu);
-			tunables = pcpu->policy->governor_data;
-
-			if (!down_read_trylock(&pcpu->enable_sem))
-				continue;
-			if (!pcpu->governor_enabled) {
-				up_read(&pcpu->enable_sem);
-				continue;
-			}
-
-			tunables->prev_max_region = tunables->max_region;
-			for_each_cpu(j, pcpu->policy->cpus) {
-				struct cpufreq_interactive_cpuinfo *pjcpu =
-					&per_cpu(cpuinfo, j);
-
-				if (pjcpu->region > max_region)
-					max_region = pjcpu->region;
-			}
-
-			if (tunables->prev_max_region != max_region) {
-				tunables->max_region = max_region;
-				coremem_region_bus_lock(max_region, pcpu->policy);
-				region_update_status(tunables);
-			}
-
-			up_read(&pcpu->enable_sem);
-		}
-	}
-
-	return 0;
-}
-#endif
 
 static int cpufreq_interactive_speedchange_task(void *data)
 {
@@ -1287,7 +1157,7 @@ static ssize_t store_above_hispeed_delay(
 	struct cpufreq_interactive_tunables *tunables,
 	const char *buf, size_t count)
 {
-	int ntokens;
+	int ntokens, i;
 	unsigned int *new_above_hispeed_delay = NULL;
 	unsigned long flags;
 #ifdef CONFIG_MODE_AUTO_CHANGE
@@ -1317,6 +1187,16 @@ static ssize_t store_above_hispeed_delay(
 	tunables->nabove_hispeed_delay = ntokens;
 #endif
 	spin_unlock_irqrestore(&tunables->above_hispeed_delay_lock, flags);
+
+	/* Make sure frequencies are in ascending order. */
+	for (i = 3; i < ntokens; i += 2) {
+		if (new_above_hispeed_delay[i] <=
+		    new_above_hispeed_delay[i - 2]) {
+			kfree(new_above_hispeed_delay);
+			return -EINVAL;
+		}
+	}
+
 	return count;
 
 }
@@ -1817,13 +1697,13 @@ static ssize_t show_cpu_util(struct cpufreq_interactive_tunables
 	return ret;
 }
 
-static ssize_t show_single_cluster0_min_freq(struct cpufreq_interactive_tunables
+static ssize_t show_single_kfc_min_freq(struct cpufreq_interactive_tunables
 		*tunables, char *buf)
 {
-	return sprintf(buf, "%u\n", tunables->single_cluster0_min_freq);
+	return sprintf(buf, "%u\n", tunables->single_kfc_min_freq);
 }
 
-static ssize_t store_single_cluster0_min_freq(struct cpufreq_interactive_tunables
+static ssize_t store_single_kfc_min_freq(struct cpufreq_interactive_tunables
 		*tunables, const char *buf, size_t count)
 {
 	int ret;
@@ -1833,17 +1713,17 @@ static ssize_t store_single_cluster0_min_freq(struct cpufreq_interactive_tunable
 	if (ret < 0)
 			return ret;
 
-	tunables->single_cluster0_min_freq = val;
+	tunables->single_kfc_min_freq = val;
 	return count;
 }
 
-static ssize_t show_multi_cluster0_min_freq(struct cpufreq_interactive_tunables
+static ssize_t show_multi_kfc_min_freq(struct cpufreq_interactive_tunables
 		*tunables, char *buf)
 {
-	return sprintf(buf, "%u\n", tunables->multi_cluster0_min_freq);
+	return sprintf(buf, "%u\n", tunables->multi_kfc_min_freq);
 }
 
-static ssize_t store_multi_cluster0_min_freq(struct cpufreq_interactive_tunables
+static ssize_t store_multi_kfc_min_freq(struct cpufreq_interactive_tunables
 		*tunables, const char *buf, size_t count)
 {
 	int ret;
@@ -1853,24 +1733,8 @@ static ssize_t store_multi_cluster0_min_freq(struct cpufreq_interactive_tunables
 	if (ret < 0)
 			return ret;
 
-	tunables->multi_cluster0_min_freq = val;
+	tunables->multi_kfc_min_freq = val;
 	return count;
-}
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-static ssize_t show_region_time_in_state(struct cpufreq_interactive_tunables *tunables,
-			  char *buf)
-{
-	int i;
-	ssize_t len = 0;
-
-	region_update_status(tunables);
-
-	for (i = 0; i < 6; i++)
-		len += snprintf(buf + len, PAGE_SIZE, "region %2d: %20llu\n",
-			i, tunables->region_time_in_state[i]);
-
-	return len;
 }
 #endif
 /*
@@ -1920,7 +1784,6 @@ show_store_gov_pol_sys(boost);
 store_gov_pol_sys(boostpulse);
 show_store_gov_pol_sys(boostpulse_duration);
 show_store_gov_pol_sys(io_is_busy);
-
 #ifdef CONFIG_MODE_AUTO_CHANGE
 show_store_gov_pol_sys(mode);
 show_store_gov_pol_sys(enforced_mode);
@@ -1933,12 +1796,9 @@ show_store_gov_pol_sys(multi_enter_time);
 show_store_gov_pol_sys(multi_exit_time);
 show_store_gov_pol_sys(single_enter_time);
 show_store_gov_pol_sys(single_exit_time);
-show_store_gov_pol_sys(single_cluster0_min_freq);
-show_store_gov_pol_sys(multi_cluster0_min_freq);
+show_store_gov_pol_sys(single_kfc_min_freq);
+show_store_gov_pol_sys(multi_kfc_min_freq);
 show_gov_pol_sys(cpu_util);
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-show_gov_pol_sys(region_time_in_state);
 #endif
 #define gov_sys_attr_rw(_name)						\
 static struct global_attr _name##_gov_sys =				\
@@ -1974,8 +1834,8 @@ gov_sys_pol_attr_rw(multi_enter_time);
 gov_sys_pol_attr_rw(multi_exit_time);
 gov_sys_pol_attr_rw(single_enter_time);
 gov_sys_pol_attr_rw(single_exit_time);
-gov_sys_pol_attr_rw(single_cluster0_min_freq);
-gov_sys_pol_attr_rw(multi_cluster0_min_freq);
+gov_sys_pol_attr_rw(single_kfc_min_freq);
+gov_sys_pol_attr_rw(multi_kfc_min_freq);
 #endif
 
 static struct global_attr boostpulse_gov_sys =
@@ -1990,14 +1850,6 @@ static struct global_attr cpu_util_gov_sys =
 static struct freq_attr cpu_util_gov_pol =
 	__ATTR(cpu_util, 0444, show_cpu_util_gov_pol, NULL);
 #endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-static struct global_attr region_time_in_state_gov_sys =
-	__ATTR(region_time_in_state, 0440, show_region_time_in_state_gov_sys, NULL);
-
-static struct freq_attr region_time_in_state_gov_pol =
-	__ATTR(region_time_in_state, 0440, show_region_time_in_state_gov_pol, NULL);
-#endif
-
 /* One Governor instance for entire system */
 static struct attribute *interactive_attributes_gov_sys[] = {
 	&target_loads_gov_sys.attr,
@@ -2023,12 +1875,9 @@ static struct attribute *interactive_attributes_gov_sys[] = {
 	&multi_exit_time_gov_sys.attr,
 	&single_enter_time_gov_sys.attr,
 	&single_exit_time_gov_sys.attr,
-	&single_cluster0_min_freq_gov_sys.attr,
-	&multi_cluster0_min_freq_gov_sys.attr,
+	&single_kfc_min_freq_gov_sys.attr,
+	&multi_kfc_min_freq_gov_sys.attr,
 	&cpu_util_gov_sys.attr,
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	&region_time_in_state_gov_sys.attr,
 #endif
 	NULL,
 };
@@ -2063,12 +1912,9 @@ static struct attribute *interactive_attributes_gov_pol[] = {
 	&multi_exit_time_gov_pol.attr,
 	&single_enter_time_gov_pol.attr,
 	&single_exit_time_gov_pol.attr,
-	&single_cluster0_min_freq_gov_pol.attr,
-	&multi_cluster0_min_freq_gov_pol.attr,
+	&single_kfc_min_freq_gov_pol.attr,
+	&multi_kfc_min_freq_gov_pol.attr,
 	&cpu_util_gov_pol.attr,
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	&region_time_in_state_gov_pol.attr,
 #endif
 	NULL,
 };
@@ -2103,12 +1949,9 @@ static const char *interactive_sysfs[] = {
 	"multi_exit_time",
 	"single_enter_time",
 	"single_exit_time",
-	"single_cluster0_min_freq",
-	"multi_cluster0_min_freq",
+	"single_kfc_min_freq",
+	"multi_kfc_min_freq",
 	"cpu_util",
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	"region_time_in_state",
 #endif
 };
 #endif
@@ -2121,46 +1964,16 @@ static struct attribute_group *get_sysfs_attr(void)
 		return &interactive_attr_group_gov_sys;
 }
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-void pmu_suspend_cpu(int cpu)
-{
-	int ret;
-
-	ret = stop_counter_cpu(cpu);
-	if (ret)
-		pr_err("%s: Fail to stop counter. cpu: %d\n", __func__, cpu);
-}
-
-void pmu_resume_cpu(int cpu)
-{
-	int ret;
-
-	ret = start_counter_cpu(cpu);
-	if (ret)
-		pr_err("%s: Fail to start counter. cpu: %d\n", __func__, cpu);
-}
-#endif
-
 static int cpufreq_interactive_idle_notifier(struct notifier_block *nb,
 					     unsigned long val,
 					     void *data)
 {
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	int cpu = smp_processor_id();
-#endif
-
 	switch (val) {
 	case IDLE_START:
 		cpufreq_interactive_idle_start();
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		pmu_suspend_cpu(cpu);
-#endif
 		break;
 	case IDLE_END:
 		cpufreq_interactive_idle_end();
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		pmu_resume_cpu(cpu);
-#endif
 		break;
 	}
 
@@ -2170,29 +1983,6 @@ static int cpufreq_interactive_idle_notifier(struct notifier_block *nb,
 static struct notifier_block cpufreq_interactive_idle_nb = {
 	.notifier_call = cpufreq_interactive_idle_notifier,
 };
-
-#ifdef CONFIG_PMU_COREMEM_RATIO
-static int __cpuinit exynos_pmu_cpu_notifier(struct notifier_block *nfb,
-		unsigned long action, void *hcpu)
-{
-	int cpu = (unsigned long)hcpu;
-
-	switch (action & ~CPU_TASKS_FROZEN) {
-	case CPU_STARTING:
-	case CPU_DOWN_FAILED:
-		pmu_resume_cpu(cpu);
-		break;
-	case CPU_DYING:
-		pmu_suspend_cpu(cpu);
-		break;
-	}
-	return NOTIFY_OK;
-}
-
-static struct notifier_block __cpuinitdata exynos_pmu_cpu_notifier_block = {
-	.notifier_call = exynos_pmu_cpu_notifier,
-};
-#endif
 
 #ifdef CONFIG_ANDROID
 static void change_sysfs_owner(struct cpufreq_policy *policy)
@@ -2251,9 +2041,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 	char speedchange_task_name[TASK_NAME_LEN];
 	unsigned long flags;
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	char regionchange_task_name[TASK_NAME_LEN];
-#endif
 
 	if (have_governor_per_policy())
 		tunables = policy->governor_data;
@@ -2298,13 +2085,10 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			tunables->single_enter_load = DEFAULT_TARGET_LOAD;
 			tunables->single_exit_time = DEFAULT_SINGLE_EXIT_TIME;
 			tunables->single_exit_load = DEFAULT_TARGET_LOAD;
-			tunables->single_cluster0_min_freq = DEFAULT_SINGLE_CLUSTER0_MIN_FREQ;
-			tunables->multi_cluster0_min_freq = DEFAULT_MULTI_CLUSTER0_MIN_FREQ;
+			tunables->single_kfc_min_freq = DEFAULT_SINGLE_KFC_MIN_FREQ;
+			tunables->multi_kfc_min_freq = DEFAULT_MULTI_KFC_MIN_FREQ;
 
 			cpufreq_param_set_init(tunables);
-#endif
-#ifdef CONFIG_PMU_COREMEM_RATIO
-			tunables->region_last_stat = jiffies;
 #endif
 		} else {
 			memcpy(tunables, tuned_parameters[policy->cpu], sizeof(*tunables));
@@ -2340,9 +2124,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 
 		if (!policy->governor->initialized) {
 			idle_notifier_register(&cpufreq_interactive_idle_nb);
-#ifdef CONFIG_PMU_COREMEM_RATIO
-			register_cpu_notifier(&exynos_pmu_cpu_notifier_block);
-#endif
 			cpufreq_register_notifier(&cpufreq_notifier_block,
 					CPUFREQ_TRANSITION_NOTIFIER);
 		}
@@ -2354,9 +2135,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			if (policy->governor->initialized == 1) {
 				cpufreq_unregister_notifier(&cpufreq_notifier_block,
 						CPUFREQ_TRANSITION_NOTIFIER);
-#ifdef CONFIG_PMU_COREMEM_RATIO
-				unregister_cpu_notifier(&exynos_pmu_cpu_notifier_block);
-#endif
 				idle_notifier_unregister(&cpufreq_interactive_idle_nb);
 			}
 
@@ -2422,35 +2200,12 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 		sched_setscheduler_nocheck(tunables->speedchange_task, SCHED_FIFO, &param);
 		get_task_struct(tunables->speedchange_task);
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		snprintf(regionchange_task_name, TASK_NAME_LEN, "region%d",
-					policy->cpu);
-
-		tunables->regionchange_task =
-			kthread_create(cpufreq_interactive_regionchange_task, NULL,
-					regionchange_task_name);
-		if (IS_ERR(tunables->regionchange_task)) {
-			kthread_stop(tunables->regionchange_task);
-			mutex_unlock(&gov_lock);
-			return PTR_ERR(tunables->regionchange_task);
-		}
-
-		sched_setscheduler_nocheck(tunables->regionchange_task, SCHED_FIFO, &param);
-		get_task_struct(tunables->regionchange_task);
-#endif
-
 #if defined(CONFIG_ARM_EXYNOS_MP_CPUFREQ) || defined(CONFIG_ARM_EXYNOS_SMP_CPUFREQ)
 		kthread_bind(tunables->speedchange_task, policy->cpu);
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		kthread_bind(tunables->regionchange_task, policy->cpu);
-#endif
 #endif
 
 		/* NB: wake up so the thread does not look hung to the freezer */
 		wake_up_process(tunables->speedchange_task);
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		wake_up_process(tunables->regionchange_task);
-#endif
 
 		mutex_unlock(&gov_lock);
 		break;
@@ -2470,22 +2225,12 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 		put_task_struct(tunables->speedchange_task);
 		tunables->speedchange_task = NULL;
 
-#ifdef CONFIG_PMU_COREMEM_RATIO
-		kthread_stop(tunables->regionchange_task);
-		put_task_struct(tunables->regionchange_task);
-		tunables->regionchange_task = NULL;
-#endif
-
 		mutex_unlock(&gov_lock);
 		break;
 
 	case CPUFREQ_GOV_LIMITS:
-		if (policy->max < policy->cur)
-			__cpufreq_driver_target(policy,
-					policy->max, CPUFREQ_RELATION_H);
-		else if (policy->min > policy->cur)
-			__cpufreq_driver_target(policy,
-					policy->min, CPUFREQ_RELATION_L);
+		__cpufreq_driver_target(policy,
+				policy->cur, CPUFREQ_RELATION_H);
 		for_each_cpu(j, policy->cpus) {
 			pcpu = &per_cpu(cpuinfo, j);
 
@@ -2558,7 +2303,7 @@ unsigned int cpufreq_interactive_get_hispeed_freq(int cpu)
 }
 
 #ifdef CONFIG_ARCH_EXYNOS
-static int cpufreq_interactive_cluster1_min_qos_handler(struct notifier_block *b,
+static int cpufreq_interactive_cpu_min_qos_handler(struct notifier_block *b,
 						unsigned long val, void *v)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu;
@@ -2566,7 +2311,7 @@ static int cpufreq_interactive_cluster1_min_qos_handler(struct notifier_block *b
 	unsigned long flags;
 	int ret = NOTIFY_OK;
 #if defined(CONFIG_ARM_EXYNOS_MP_CPUFREQ)
-	int cpu = NR_CLUST0_CPUS;
+	int cpu = NR_CA7;
 #else
 	int cpu = 0;
 #endif
@@ -2605,11 +2350,11 @@ exit:
 	return ret;
 }
 
-static struct notifier_block cpufreq_interactive_cluster1_min_qos_notifier = {
-	.notifier_call = cpufreq_interactive_cluster1_min_qos_handler,
+static struct notifier_block cpufreq_interactive_cpu_min_qos_notifier = {
+	.notifier_call = cpufreq_interactive_cpu_min_qos_handler,
 };
 
-static int cpufreq_interactive_cluster1_max_qos_handler(struct notifier_block *b,
+static int cpufreq_interactive_cpu_max_qos_handler(struct notifier_block *b,
 						unsigned long val, void *v)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu;
@@ -2617,7 +2362,7 @@ static int cpufreq_interactive_cluster1_max_qos_handler(struct notifier_block *b
 	unsigned long flags;
 	int ret = NOTIFY_OK;
 #if defined(CONFIG_ARM_EXYNOS_MP_CPUFREQ)
-	int cpu = NR_CLUST0_CPUS;
+	int cpu = NR_CA7;
 #else
 	int cpu = 0;
 #endif
@@ -2656,12 +2401,12 @@ exit:
 	return ret;
 }
 
-static struct notifier_block cpufreq_interactive_cluster1_max_qos_notifier = {
-	.notifier_call = cpufreq_interactive_cluster1_max_qos_handler,
+static struct notifier_block cpufreq_interactive_cpu_max_qos_notifier = {
+	.notifier_call = cpufreq_interactive_cpu_max_qos_handler,
 };
 
 #ifdef CONFIG_ARM_EXYNOS_MP_CPUFREQ
-static int cpufreq_interactive_cluster0_min_qos_handler(struct notifier_block *b,
+static int cpufreq_interactive_kfc_min_qos_handler(struct notifier_block *b,
 						unsigned long val, void *v)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu;
@@ -2703,11 +2448,11 @@ exit:
 	return ret;
 }
 
-static struct notifier_block cpufreq_interactive_cluster0_min_qos_notifier = {
-	.notifier_call = cpufreq_interactive_cluster0_min_qos_handler,
+static struct notifier_block cpufreq_interactive_kfc_min_qos_notifier = {
+	.notifier_call = cpufreq_interactive_kfc_min_qos_handler,
 };
 
-static int cpufreq_interactive_cluster0_max_qos_handler(struct notifier_block *b,
+static int cpufreq_interactive_kfc_max_qos_handler(struct notifier_block *b,
 						unsigned long val, void *v)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu;
@@ -2749,8 +2494,8 @@ exit:
 	return ret;
 }
 
-static struct notifier_block cpufreq_interactive_cluster0_max_qos_notifier = {
-	.notifier_call = cpufreq_interactive_cluster0_max_qos_handler,
+static struct notifier_block cpufreq_interactive_kfc_max_qos_notifier = {
+	.notifier_call = cpufreq_interactive_kfc_max_qos_handler,
 };
 #endif
 #endif
@@ -2774,17 +2519,14 @@ static int __init cpufreq_interactive_init(void)
 	}
 
 	spin_lock_init(&speedchange_cpumask_lock);
-#ifdef CONFIG_PMU_COREMEM_RATIO
-	spin_lock_init(&regionchange_cpumask_lock);
-#endif
 	mutex_init(&gov_lock);
 
 #ifdef CONFIG_ARCH_EXYNOS
-	pm_qos_add_notifier(PM_QOS_CLUSTER1_FREQ_MIN, &cpufreq_interactive_cluster1_min_qos_notifier);
-	pm_qos_add_notifier(PM_QOS_CLUSTER1_FREQ_MAX, &cpufreq_interactive_cluster1_max_qos_notifier);
+	pm_qos_add_notifier(PM_QOS_CPU_FREQ_MIN, &cpufreq_interactive_cpu_min_qos_notifier);
+	pm_qos_add_notifier(PM_QOS_CPU_FREQ_MAX, &cpufreq_interactive_cpu_max_qos_notifier);
 #ifdef CONFIG_ARM_EXYNOS_MP_CPUFREQ
-	pm_qos_add_notifier(PM_QOS_CLUSTER0_FREQ_MIN, &cpufreq_interactive_cluster0_min_qos_notifier);
-	pm_qos_add_notifier(PM_QOS_CLUSTER0_FREQ_MAX, &cpufreq_interactive_cluster0_max_qos_notifier);
+	pm_qos_add_notifier(PM_QOS_KFC_FREQ_MIN, &cpufreq_interactive_kfc_min_qos_notifier);
+	pm_qos_add_notifier(PM_QOS_KFC_FREQ_MAX, &cpufreq_interactive_kfc_max_qos_notifier);
 #endif
 #endif
 
@@ -2800,7 +2542,7 @@ static int __init cpufreq_interactive_init(void)
 #ifdef CONFIG_MODE_AUTO_CHANGE
 static void mode_auto_change_minlock(struct work_struct *work)
 {
-	set_qos(&cluster0_min_freq_qos, PM_QOS_CLUSTER0_FREQ_MIN, cluster0_min_freq);
+	set_qos(&kfc_min_freq_qos, PM_QOS_KFC_FREQ_MIN, kfc_min_freq);
 }
 #endif
 
